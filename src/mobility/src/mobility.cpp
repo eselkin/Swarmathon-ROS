@@ -15,6 +15,10 @@
 #include <geometry_msgs/Twist.h>
 #include <nav_msgs/Odometry.h>
 
+// To handle shutdown signals so the node quits properly in response to "rosnode kill"
+#include <ros/ros.h>
+#include <signal.h>
+
 using namespace std;
 
 //Random number generator
@@ -27,8 +31,9 @@ void setVelocity(double linearVel, double angularVel);
 geometry_msgs::Pose2D currentLocation;
 geometry_msgs::Pose2D goalLocation;
 int currentMode = 0;
-float mobilityLoopTimeStep = 0.125; //time between the mobility loop calls
+float mobilityLoopTimeStep = 0.1; //time between the mobility loop calls
 float status_publish_interval = 5;
+float killSwitchTimeout = 10;
 std_msgs::Int16 targetDetected; //ID of the detected target
 bool targetsCollected [256] = {0}; //array of booleans indicating whether each target ID has been found
 
@@ -38,13 +43,13 @@ bool targetsCollected [256] = {0}; //array of booleans indicating whether each t
 #define STATE_MACHINE_TRANSLATE	2
 int stateMachineState = STATE_MACHINE_TRANSFORM;
 
-geometry_msgs::Twist mobility;
+geometry_msgs::Twist velocity;
 char host[128];
 string publishedName;
 char prev_state_machine[128];
 
 //Publishers
-ros::Publisher mobilityPublish;
+ros::Publisher velocityPublish;
 ros::Publisher stateMachinePublish;
 ros::Publisher status_publisher;
 ros::Publisher targetCollectedPublish;
@@ -60,17 +65,21 @@ ros::Subscriber targetsCollectedSubscriber;
 //Timers
 ros::Timer stateMachineTimer;
 ros::Timer publish_status_timer;
+ros::Timer killSwitchTimer;
 
+// OS Signal Handler
+void sigintEventHandler(int signal);
 
 //Callback handlers
-void joyCmdHandler(const sensor_msgs::Joy::ConstPtr& message);
+void joyCmdHandler(const geometry_msgs::Twist::ConstPtr& message);
 void modeHandler(const std_msgs::UInt8::ConstPtr& message);
 void targetHandler(const std_msgs::Int16::ConstPtr& tagInfo);
 void obstacleHandler(const std_msgs::UInt8::ConstPtr& message);
 void odometryHandler(const nav_msgs::Odometry::ConstPtr& message);
 void mobilityStateMachine(const ros::TimerEvent&);
-void publishStatusTimerEventHandler(const ros::TimerEvent&);
+void publishStatusTimerEventHandler(const ros::TimerEvent& event);
 void targetsCollectedHandler(const std_msgs::Int16::ConstPtr& message);
+void killSwitchTimerEventHandler(const ros::TimerEvent& event);
 
 int main(int argc, char **argv) {
 
@@ -94,8 +103,11 @@ int main(int argc, char **argv) {
         cout << "No Name Selected. Default is: " << publishedName << endl;
     }
 
-    ros::init(argc, argv, (publishedName + "_MOBILITY"));
+    // NoSignalHandler so we can catch SIGINT ourselves and shutdown the node
+    ros::init(argc, argv, (publishedName + "_MOBILITY"), ros::init_options::NoSigintHandler);
     ros::NodeHandle mNH;
+
+    signal(SIGINT, sigintEventHandler); // Register the SIGINT event handler so the node can shutdown properly
 
     joySubscriber = mNH.subscribe((publishedName + "/joystick"), 10, joyCmdHandler);
     modeSubscriber = mNH.subscribe((publishedName + "/mode"), 1, modeHandler);
@@ -105,11 +117,12 @@ int main(int argc, char **argv) {
     targetsCollectedSubscriber = mNH.subscribe(("targetsCollected"), 10, targetsCollectedHandler);
 
     status_publisher = mNH.advertise<std_msgs::String>((publishedName + "/status"), 1, true);
-    mobilityPublish = mNH.advertise<geometry_msgs::Twist>((publishedName + "/mobility"), 10);
+    velocityPublish = mNH.advertise<geometry_msgs::Twist>((publishedName + "/velocity"), 10);
     stateMachinePublish = mNH.advertise<std_msgs::String>((publishedName + "/state_machine"), 1, true);
     targetCollectedPublish = mNH.advertise<std_msgs::Int16>(("targetsCollected"), 1, true);
 
     publish_status_timer = mNH.createTimer(ros::Duration(status_publish_interval), publishStatusTimerEventHandler);
+    killSwitchTimer = mNH.createTimer(ros::Duration(killSwitchTimeout), killSwitchTimerEventHandler);
     stateMachineTimer = mNH.createTimer(ros::Duration(mobilityLoopTimeStep), mobilityStateMachine);
     
     ros::spin();
@@ -139,7 +152,7 @@ void mobilityStateMachine(const ros::TimerEvent&) {
 				//If returning with a target
 				else if (targetDetected.data != -1) {
 					//If goal has not yet been reached
-					if (hypot(0.0 - currentLocation.x, 0.0 - currentLocation.y) > 0.2) {
+					if (hypot(0.0 - currentLocation.x, 0.0 - currentLocation.y) > 0.5) {
 				        //set angle to center as goal heading
 						goalLocation.theta = M_PI + atan2(currentLocation.y, currentLocation.x);
 						
@@ -156,7 +169,7 @@ void mobilityStateMachine(const ros::TimerEvent&) {
 				//Otherwise, assign a new goal
 				else {
 					 //select new heading from Gaussian distribution around current heading
-					goalLocation.theta = rng->gaussian(currentLocation.theta, 1.0);
+					goalLocation.theta = rng->gaussian(currentLocation.theta, 0.25);
 					
 					//select new position 50 cm from current location
 					goalLocation.x = currentLocation.x + (0.5 * cos(goalLocation.theta));
@@ -172,10 +185,10 @@ void mobilityStateMachine(const ros::TimerEvent&) {
 			case STATE_MACHINE_ROTATE: {
 				stateMachineMsg.data = "ROTATING";
 			    if (angles::shortest_angular_distance(currentLocation.theta, goalLocation.theta) > 0.1) {
-					setVelocity(0.0, 0.3); //rotate left
+					setVelocity(0.0, 0.2); //rotate left
 			    }
 			    else if (angles::shortest_angular_distance(currentLocation.theta, goalLocation.theta) < -0.1) {
-					setVelocity(0.0, -0.3); //rotate right
+					setVelocity(0.0, -0.2); //rotate right
 				}
 				else {
 					setVelocity(0.0, 0.0); //stop
@@ -218,10 +231,17 @@ void mobilityStateMachine(const ros::TimerEvent&) {
     }
 }
 
-void setVelocity(double linearVel, double angularVel) {
-    mobility.linear.x = linearVel * 1.5;
-    mobility.angular.z = angularVel * 8; //scaling factor for sim; removed by aBridge node
-    mobilityPublish.publish(mobility);
+void setVelocity(double linearVel, double angularVel) 
+{
+  // Stopping and starting the timer causes it to start counting from 0 again.
+  // As long as this is called before the kill swith timer reaches killSwitchTimeout seconds
+  // the rover's kill switch wont be called.
+  //killSwitchTimer.stop();
+  //killSwitchTimer.start();
+  
+  velocity.linear.x = linearVel * 1.5;
+  velocity.angular.z = angularVel * 8; //scaling factor for sim; removed by aBridge node
+  velocityPublish.publish(velocity);
 }
 
 /***********************
@@ -292,12 +312,11 @@ void odometryHandler(const nav_msgs::Odometry::ConstPtr& message) {
 	currentLocation.theta = yaw;
 }
 
-void joyCmdHandler(const sensor_msgs::Joy::ConstPtr& message) {
-    if (currentMode == 0 || currentMode == 1) {
-        mobility.angular.z = message->axes[0] * 8;
-        mobility.linear.x = message->axes[1] * 1.5;
-        mobilityPublish.publish(mobility);
-    } 
+void joyCmdHandler(const geometry_msgs::Twist::ConstPtr& message) {
+    if (currentMode == 0 || currentMode == 1) 
+      {
+	setVelocity(message->linear.x, message->angular.z);
+      } 
 }
 
 
@@ -308,6 +327,22 @@ void publishStatusTimerEventHandler(const ros::TimerEvent&)
   status_publisher.publish(msg);
 }
 
+// Safety precaution. No movement commands - might have lost contact with ROS. Stop the rover.
+// Also might no longer be receiving manual movement commands so stop the rover.
+void killSwitchTimerEventHandler(const ros::TimerEvent& t)
+{
+  // No movement commands for killSwitchTime seconds so stop the rover 
+  setVelocity(0,0);
+  double current_time = ros::Time::now().toSec();
+  ROS_INFO("In mobility.cpp:: killSwitchTimerEventHander(): Movement input timeout. Stopping the rover at %6.4f.", current_time);
+}
+
 void targetsCollectedHandler(const std_msgs::Int16::ConstPtr& message) {
 	targetsCollected[message->data] = 1;
+}
+
+void sigintEventHandler(int sig)
+{
+     // All the default sigint handler does is call shutdown()
+     ros::shutdown();
 }
